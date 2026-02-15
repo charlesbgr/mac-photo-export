@@ -59,9 +59,17 @@ on isMediaExtension(extValue)
 end isMediaExtension
 
 on isSidecarExtension(extValue)
-	set sidecarExts to {"aae", "xmp", "json", "plist", "xml", "thm", "dop"}
+	set sidecarExts to {"aae", "xmp", "json", "plist", "xml", "thm", "dop", "ds_store"}
 	return (sidecarExts contains extValue)
 end isSidecarExtension
+
+on fileNameFromPath(filePath)
+	set oldDelims to AppleScript's text item delimiters
+	set AppleScript's text item delimiters to "/"
+	set fileName to last text item of filePath
+	set AppleScript's text item delimiters to oldDelims
+	return fileName
+end fileNameFromPath
 
 on linesFromText(rawText)
 	if rawText is "" then return {}
@@ -73,19 +81,23 @@ on linesFromText(rawText)
 end linesFromText
 
 on atomicCopyFile(srcPath, destPath, finalStem, targetExt)
-	return do shell script "f=" & quoted form of (destPath & finalStem) & "; e=" & quoted form of targetExt & "; s=" & quoted form of srcPath & "; p=\"$f.$e\"; c=1; while true; do if [ -e \"$p\" ]; then p=\"${f}_${c}.${e}\"; c=$((c+1)); if [ $c -gt 999 ]; then echo FAIL; exit 1; fi; continue; fi; if cp \"$s\" \"$p\" 2>/dev/null && [ -f \"$p\" ]; then echo \"$p\"; exit 0; fi; echo FAIL; exit 1; done"
+	return do shell script "f=" & quoted form of (destPath & finalStem) & "; e=" & quoted form of targetExt & "; s=" & quoted form of srcPath & "; p=\"$f.$e\"; c=1; while true; do if [ -e \"$p\" ]; then p=\"${f}_${c}.${e}\"; c=$((c+1)); if [ $c -gt 999 ]; then echo FAIL; exit 1; fi; continue; fi; if cp -n \"$s\" \"$p\" 2>/dev/null && [ -f \"$p\" ]; then echo \"$p\"; exit 0; fi; echo FAIL; exit 1; done"
 end atomicCopyFile
 
 on atomicSipsConvert(srcPath, destPath, finalStem, targetExt)
-	return do shell script "f=" & quoted form of (destPath & finalStem) & "; e=" & quoted form of targetExt & "; s=" & quoted form of srcPath & "; d=" & quoted form of destPath & "; tmp=$(mktemp \"${d}.tmp.XXXXXX\"); sips -s format jpeg -s formatOptions 80 \"$s\" --out \"$tmp\" >/dev/null 2>&1 || { rm -f \"$tmp\"; echo FAIL; exit 1; }; p=\"$f.$e\"; c=1; while true; do if [ -e \"$p\" ]; then p=\"${f}_${c}.${e}\"; c=$((c+1)); if [ $c -gt 999 ]; then rm -f \"$tmp\"; echo FAIL; exit 1; fi; continue; fi; if mv \"$tmp\" \"$p\" 2>/dev/null && [ ! -f \"$tmp\" ]; then echo \"$p\"; exit 0; fi; rm -f \"$tmp\"; echo FAIL; exit 1; done"
+	return do shell script "f=" & quoted form of (destPath & finalStem) & "; e=" & quoted form of targetExt & "; s=" & quoted form of srcPath & "; d=" & quoted form of destPath & "; tmp=$(mktemp \"${d}.tmp.XXXXXX\"); sips -s format jpeg -s formatOptions 80 \"$s\" --out \"$tmp\" >/dev/null 2>&1 || { rm -f \"$tmp\"; echo FAIL; exit 1; }; p=\"$f.$e\"; c=1; while true; do if [ -e \"$p\" ]; then p=\"${f}_${c}.${e}\"; c=$((c+1)); if [ $c -gt 999 ]; then rm -f \"$tmp\"; echo FAIL; exit 1; fi; continue; fi; if mv -n \"$tmp\" \"$p\" 2>/dev/null && [ ! -f \"$tmp\" ]; then echo \"$p\"; exit 0; fi; rm -f \"$tmp\"; echo FAIL; exit 1; done"
 end atomicSipsConvert
 
 on rollbackCreatedFiles(pathList)
 	set deletedCount to 0
 	repeat with p in pathList
 		try
-			do shell script "rm -f " & quoted form of (contents of p)
-			set deletedCount to deletedCount + 1
+			set filePath to contents of p
+			set fileExists to do shell script "[ -f " & quoted form of filePath & " ] && echo yes || echo no"
+			if fileExists is "yes" then
+				do shell script "rm -f " & quoted form of filePath
+				set deletedCount to deletedCount + 1
+			end if
 		end try
 	end repeat
 	return deletedCount
@@ -170,9 +182,12 @@ tell application "Photos"
 			else
 				repeat with exportedFile in exportedPaths
 					set inputFilePath to contents of exportedFile
+					set inputFileName to my fileNameFromPath(inputFilePath)
 					set inputExt to my extensionFromPath(inputFilePath)
-					
-					if my isMediaExtension(inputExt) then
+
+					if inputFileName starts with "._" then
+						set runLog to my appendLog(runLog, "SKIP-FILE item " & i & " : resource fork " & inputFilePath)
+					else if my isMediaExtension(inputExt) then
 						set inputIsVideo to my isVideoExtension(inputExt)
 						
 						if inputIsVideo then
@@ -286,7 +301,7 @@ tell application "Photos"
 	-- Si extension inconnue, rollback complet des fichiers crees
 	if abortRun then
 		set rollbackDeletedCount to my rollbackCreatedFiles(createdOutputPaths)
-		set summaryText to "Nouvelle extension detectee (" & abortExtension & "). Export reverti. Merci de mettre a jour le script." & return & "Fichier: " & abortFilePath & return & "Fichiers de ce run supprimes: " & rollbackDeletedCount
+		set summaryText to "Nouvelle extension detectee (" & abortExtension & "). Export reverti. Merci de mettre a jour le script." & return & "Fichier: " & abortFilePath & return & "Fichiers de ce run supprimes: " & rollbackDeletedCount & return & "(Un rapport de diagnostic est conserve dans le dossier d'export.)"
 	else
 		if deliveredItemCount is totalItems then
 			set summaryLead to "Tous les items ont ete livres (" & totalItems & ")."
