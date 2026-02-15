@@ -1,5 +1,6 @@
--- Script V5 : Export Photos/Videos avec ID stable et rapport
+-- Script V6 : Export Photos/Videos avec ID stable et rapport
 -- Photos -> JPG (qualite 80), videos -> copie format exporte
+-- Live Photos -> les deux composants (JPG + MOV) sont exportes
 -- Nom : YYMMDD-HHMM-SS-<ID8>.<ext>
 
 on twoDigits(n)
@@ -7,19 +8,7 @@ on twoDigits(n)
 end twoDigits
 
 on lowerText(inputText)
-	set sourceChars to "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	set targetChars to "abcdefghijklmnopqrstuvwxyz"
-	set lowered to ""
-	repeat with i from 1 to (length of inputText)
-		set currentChar to character i of inputText
-		set p to offset of currentChar in sourceChars
-		if p is 0 then
-			set lowered to lowered & currentChar
-		else
-			set lowered to lowered & character p of targetChars
-		end if
-	end repeat
-	return lowered
+	return do shell script "echo " & quoted form of inputText & " | tr '[:upper:]' '[:lower:]'"
 end lowerText
 
 on shortTokenForText(rawValue)
@@ -56,27 +45,8 @@ on linesFromText(rawText)
 	return outLines
 end linesFromText
 
-on chooseBestExportedPath(pathList, preferVideo)
-	if (count of pathList) is 0 then return ""
-	set fallbackPath to item 1 of pathList
-	repeat with p in pathList
-		set candidatePath to contents of p
-		set candidateExt to my extensionFromPath(candidatePath)
-		set candidateIsVideo to my isVideoExtension(candidateExt)
-		if preferVideo and candidateIsVideo then return candidatePath
-		if (not preferVideo) and (not candidateIsVideo) then return candidatePath
-	end repeat
-	return fallbackPath
-end chooseBestExportedPath
-
 on nextAvailablePath(destPath, finalStem, targetExt)
-	set outputFilePath to destPath & finalStem & "." & targetExt
-	set counter to 1
-	repeat while (do shell script "if [ -e " & quoted form of outputFilePath & " ]; then echo yes; else echo no; fi") is "yes"
-		set outputFilePath to destPath & finalStem & "_" & counter & "." & targetExt
-		set counter to counter + 1
-	end repeat
-	return outputFilePath
+	return do shell script "f=" & quoted form of (destPath & finalStem) & "; e=" & quoted form of targetExt & "; p=\"$f.$e\"; c=1; while [ -e \"$p\" ]; do p=\"${f}_${c}.${e}\"; c=$((c+1)); done; echo \"$p\""
 end nextAvailablePath
 
 on appendLog(currentLog, lineText)
@@ -106,9 +76,10 @@ tell application "Photos"
 	set failedCount to 0
 	set runLog to ""
 	
-	display notification "Export de " & (count of mediaItems) & " elements..." with title "Export avec ID"
-	
-	repeat with i from 1 to (count of mediaItems)
+	set totalItems to count of mediaItems
+	display notification "Export de " & totalItems & " elements..." with title "Export avec ID"
+
+	repeat with i from 1 to totalItems
 		set theItem to item i of mediaItems
 		set itemTempPath to ""
 		
@@ -131,70 +102,63 @@ tell application "Photos"
 			set shortToken to shortTokenForText(mediaIdentifier)
 			set finalStem to y & m & d & "-" & h & min & "-" & s & "-" & shortToken
 			
-			-- 2) Detection du type attendu depuis Photos
-			set expectedVideo to false
-			try
-				set mediaKind to (kind of theItem) as string
-				set mediaKindLower to my lowerText(mediaKind)
-				if mediaKindLower contains "video" then set expectedVideo to true
-				if mediaKindLower contains "movie" then set expectedVideo to true
-			end try
-			
-			-- 3) Export isole dans dossier temp item
+			-- 2) Export isole dans dossier temp item
 			set itemTempPath to tempRootPath & "item-" & i & "-" & shortToken & "/"
 			do shell script "mkdir -p " & quoted form of itemTempPath
 			set itemTempFolder to POSIX file itemTempPath as alias
 			export {theItem} to itemTempFolder without using originals
 			
-			-- 4) Recuperer de facon deterministe un fichier exporte coherent
+			-- 3) Recuperer tous les fichiers exportes (Live Photos = photo + video)
 			set exportedRaw to do shell script "find " & quoted form of itemTempPath & " -maxdepth 1 -type f | LC_ALL=C sort"
 			set exportedPaths to my linesFromText(exportedRaw)
-			
+
 			if (count of exportedPaths) is 0 then
 				set skippedCount to skippedCount + 1
 				set runLog to my appendLog(runLog, "SKIP item " & i & " : export introuvable")
 			else
-				set inputFilePath to my chooseBestExportedPath(exportedPaths, expectedVideo)
-				set inputExt to my extensionFromPath(inputFilePath)
-				set inputIsVideo to my isVideoExtension(inputExt)
-				
-				-- 5) Cible et traitement
-				if expectedVideo or inputIsVideo then
-					if inputExt is "" then
-						set targetExt to "mov"
+				-- 4) Traiter chaque fichier exporte (photo et/ou video)
+				repeat with exportedFile in exportedPaths
+					set inputFilePath to contents of exportedFile
+					set inputExt to my extensionFromPath(inputFilePath)
+					set inputIsVideo to my isVideoExtension(inputExt)
+
+					if inputIsVideo then
+						if inputExt is "" then
+							set targetExt to "mov"
+						else
+							set targetExt to inputExt
+						end if
 					else
-						set targetExt to inputExt
+						set targetExt to "jpg"
 					end if
-				else
-					set targetExt to "jpg"
-				end if
-				
-				set outputFilePath to my nextAvailablePath(destPath, finalStem, targetExt)
-				
-				try
-					if expectedVideo or inputIsVideo then
-						do shell script "cp " & quoted form of inputFilePath & " " & quoted form of outputFilePath
-						set successCount to successCount + 1
-						set runLog to my appendLog(runLog, "OK item " & i & " : " & outputFilePath)
-					else
-						do shell script "sips -s format jpeg -s formatOptions 80 " & quoted form of inputFilePath & " --out " & quoted form of outputFilePath
-						set successCount to successCount + 1
-						set runLog to my appendLog(runLog, "OK item " & i & " : " & outputFilePath)
-					end if
-				on error convertErrMsg number convertErrNum
-					-- Fallback : garder une copie originale exportee pour ne pas perdre l'item
-					set fallbackExt to inputExt
-					if fallbackExt is "" then set fallbackExt to "bin"
-					set fallbackPath to my nextAvailablePath(destPath, finalStem & "-orig", fallbackExt)
+
+					set outputFilePath to my nextAvailablePath(destPath, finalStem, targetExt)
+
 					try
-						do shell script "cp " & quoted form of inputFilePath & " " & quoted form of fallbackPath
-						set fallbackCount to fallbackCount + 1
-						set runLog to my appendLog(runLog, "FALLBACK item " & i & " : " & fallbackPath & " (erreur " & convertErrNum & ")")
-					on error fallbackErrMsg number fallbackErrNum
-						set failedCount to failedCount + 1
-						set runLog to my appendLog(runLog, "FAIL item " & i & " : conversion=" & convertErrNum & ", fallback=" & fallbackErrNum)
+						if inputIsVideo then
+							do shell script "cp " & quoted form of inputFilePath & " " & quoted form of outputFilePath
+							set successCount to successCount + 1
+							set runLog to my appendLog(runLog, "OK item " & i & " : " & outputFilePath)
+						else
+							do shell script "sips -s format jpeg -s formatOptions 80 " & quoted form of inputFilePath & " --out " & quoted form of outputFilePath
+							set successCount to successCount + 1
+							set runLog to my appendLog(runLog, "OK item " & i & " : " & outputFilePath)
+						end if
+					on error convertErrMsg number convertErrNum
+						-- Fallback : garder une copie originale exportee pour ne pas perdre l'item
+						set fallbackExt to inputExt
+						if fallbackExt is "" then set fallbackExt to "bin"
+						set fallbackPath to my nextAvailablePath(destPath, finalStem & "-orig", fallbackExt)
+						try
+							do shell script "cp " & quoted form of inputFilePath & " " & quoted form of fallbackPath
+							set fallbackCount to fallbackCount + 1
+							set runLog to my appendLog(runLog, "FALLBACK item " & i & " : " & fallbackPath & " (erreur " & convertErrNum & ")")
+						on error fallbackErrMsg number fallbackErrNum
+							set failedCount to failedCount + 1
+							set runLog to my appendLog(runLog, "FAIL item " & i & " : conversion=" & convertErrNum & ", fallback=" & fallbackErrNum)
+						end try
 					end try
-				end try
+				end repeat
 			end if
 			
 		on error itemErrMsg number itemErrNum
@@ -202,6 +166,11 @@ tell application "Photos"
 			set runLog to my appendLog(runLog, "FAIL item " & i & " : " & itemErrNum & " (" & itemErrMsg & ")")
 		end try
 		
+		-- 5) Progression
+		if i mod 10 is 0 then
+			display notification "Exporte " & i & " / " & totalItems & "..." with title "Export avec ID"
+		end if
+
 		-- 6) Nettoyage temp item, meme en cas d'erreur
 		if itemTempPath is not "" then
 			try
@@ -210,7 +179,7 @@ tell application "Photos"
 		end if
 	end repeat
 	
-	-- 7) Nettoyage temp run
+	-- 7) Nettoyage temp run final
 	try
 		do shell script "rm -rf " & quoted form of tempRootPath
 	end try
@@ -222,13 +191,14 @@ tell application "Photos"
 	try
 		set reportRef to open for access (POSIX file reportPath) with write permission
 		set eof reportRef to 0
-		write ("Export report" & return & "Run: " & runToken & return & "Total selection: " & (count of mediaItems) & return & "Succes: " & successCount & return & "Fallback: " & fallbackCount & return & "Ignores: " & skippedCount & return & "Echecs: " & failedCount & return & return & runLog) to reportRef starting at eof
+		write ("Export report" & return & "Run: " & runToken & return & "Total selection: " & (count of mediaItems) & return & "Succes: " & successCount & return & "Fallback: " & fallbackCount & return & "Ignores: " & skippedCount & return & "Echecs: " & failedCount & return & return & runLog) to reportRef
 		close access reportRef
 		set summaryText to summaryText & return & "Rapport: " & reportPath
-	on error
+	on error reportErrMsg
 		try
 			close access reportRef
 		end try
+		set summaryText to summaryText & return & "Erreur ecriture rapport: " & reportErrMsg
 	end try
 	
 	display dialog summaryText buttons {"Parfait"} default button 1 icon note
