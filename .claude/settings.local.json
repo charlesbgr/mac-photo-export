@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(osacompile -e 'on lowerText\\(inputText\\)\n\treturn do shell script \"\"echo \"\" & quoted form of inputText & \"\" | tr '\"''\"'[:upper:]'\"''\"' '\"''\"'[:lower:]'\"''\"'\"\"\nend lowerText' -o /dev/null)",
+      "Bash(osacompile:*)",
+      "Bash(xxd:*)",
+      "Bash(echo:*)"
+    ]
+  }
+}
