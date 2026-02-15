@@ -1,7 +1,7 @@
--- Script V7 : Export Photos/Videos avec ID stable et rapport
+-- Script V8 : Export Photos/Videos avec ID stable, rollback et rapport complet
 -- Photos -> JPG (qualite 80), videos -> copie format exporte
 -- Live Photos -> les deux composants (JPG + MOV) sont exportes
--- Sidecars (.aae etc.) filtres, ecritures atomiques, compteurs item/fichier
+-- Nouvelle extension inconnue -> export annule et rollback complet des fichiers crees
 -- Nom : YYMMDD-HHMM-SS-<ID8>.<ext>
 
 on twoDigits(n)
@@ -49,11 +49,19 @@ on isVideoExtension(extValue)
 	return (videoExts contains extValue)
 end isVideoExtension
 
-on isMediaExtension(extValue)
+on isPhotoExtension(extValue)
 	set photoExts to {"jpg", "jpeg", "heic", "heif", "png", "tiff", "tif", "bmp", "gif", "webp", "raw", "cr2", "nef", "arw", "dng"}
-	set videoExts to {"mov", "mp4", "m4v", "avi", "mkv", "3gp", "mts", "m2ts", "wmv", "webm"}
-	return (photoExts contains extValue) or (videoExts contains extValue)
+	return (photoExts contains extValue)
+end isPhotoExtension
+
+on isMediaExtension(extValue)
+	return (my isPhotoExtension(extValue)) or (my isVideoExtension(extValue))
 end isMediaExtension
+
+on isSidecarExtension(extValue)
+	set sidecarExts to {"aae", "xmp", "json", "plist", "xml", "thm", "dop"}
+	return (sidecarExts contains extValue)
+end isSidecarExtension
 
 on linesFromText(rawText)
 	if rawText is "" then return {}
@@ -65,12 +73,23 @@ on linesFromText(rawText)
 end linesFromText
 
 on atomicCopyFile(srcPath, destPath, finalStem, targetExt)
-	return do shell script "f=" & quoted form of (destPath & finalStem) & "; e=" & quoted form of targetExt & "; s=" & quoted form of srcPath & "; p=\"$f.$e\"; c=1; while true; do if cp -n \"$s\" \"$p\" 2>/dev/null && [ -f \"$p\" ]; then echo \"$p\"; exit 0; fi; p=\"${f}_${c}.${e}\"; c=$((c+1)); if [ $c -gt 999 ]; then echo FAIL; exit 1; fi; done"
+	return do shell script "f=" & quoted form of (destPath & finalStem) & "; e=" & quoted form of targetExt & "; s=" & quoted form of srcPath & "; p=\"$f.$e\"; c=1; while true; do if [ -e \"$p\" ]; then p=\"${f}_${c}.${e}\"; c=$((c+1)); if [ $c -gt 999 ]; then echo FAIL; exit 1; fi; continue; fi; if cp \"$s\" \"$p\" 2>/dev/null && [ -f \"$p\" ]; then echo \"$p\"; exit 0; fi; echo FAIL; exit 1; done"
 end atomicCopyFile
 
 on atomicSipsConvert(srcPath, destPath, finalStem, targetExt)
-	return do shell script "f=" & quoted form of (destPath & finalStem) & "; e=" & quoted form of targetExt & "; s=" & quoted form of srcPath & "; d=" & quoted form of destPath & "; tmp=$(mktemp \"${d}.tmp.XXXXXX\"); sips -s format jpeg -s formatOptions 80 \"$s\" --out \"$tmp\" >/dev/null 2>&1 || { rm -f \"$tmp\"; echo FAIL; exit 1; }; p=\"$f.$e\"; c=1; while true; do if mv -n \"$tmp\" \"$p\" 2>/dev/null && [ ! -f \"$tmp\" ]; then echo \"$p\"; exit 0; fi; p=\"${f}_${c}.${e}\"; c=$((c+1)); if [ $c -gt 999 ]; then rm -f \"$tmp\"; echo FAIL; exit 1; fi; done"
+	return do shell script "f=" & quoted form of (destPath & finalStem) & "; e=" & quoted form of targetExt & "; s=" & quoted form of srcPath & "; d=" & quoted form of destPath & "; tmp=$(mktemp \"${d}.tmp.XXXXXX\"); sips -s format jpeg -s formatOptions 80 \"$s\" --out \"$tmp\" >/dev/null 2>&1 || { rm -f \"$tmp\"; echo FAIL; exit 1; }; p=\"$f.$e\"; c=1; while true; do if [ -e \"$p\" ]; then p=\"${f}_${c}.${e}\"; c=$((c+1)); if [ $c -gt 999 ]; then rm -f \"$tmp\"; echo FAIL; exit 1; fi; continue; fi; if mv \"$tmp\" \"$p\" 2>/dev/null && [ ! -f \"$tmp\" ]; then echo \"$p\"; exit 0; fi; rm -f \"$tmp\"; echo FAIL; exit 1; done"
 end atomicSipsConvert
+
+on rollbackCreatedFiles(pathList)
+	set deletedCount to 0
+	repeat with p in pathList
+		try
+			do shell script "rm -f " & quoted form of (contents of p)
+			set deletedCount to deletedCount + 1
+		end try
+	end repeat
+	return deletedCount
+end rollbackCreatedFiles
 
 on appendLog(currentLog, lineText)
 	if currentLog is "" then return lineText
@@ -93,21 +112,30 @@ tell application "Photos"
 	set tempRootPath to (POSIX path of (path to temporary items)) & "mac-photo-export-" & runToken & "/"
 	do shell script "mkdir -p " & quoted form of tempRootPath
 	
-	set itemSuccessCount to 0
-	set fileCount to 0
-	set fallbackCount to 0
-	set skippedCount to 0
+	set totalItems to count of mediaItems
+	set deliveredItemCount to 0
+	set deliveredFileCount to 0
+	set primaryFileCount to 0
+	set fallbackFileCount to 0
+	set jpgConversionFailureCount to 0
+	set jpgFallbackFileCount to 0
+	set skippedItemCount to 0
 	set failedCount to 0
 	set runLog to ""
+	set createdOutputPaths to {}
 	
-	set totalItems to count of mediaItems
+	set abortRun to false
+	set abortExtension to ""
+	set abortFilePath to ""
+	set rollbackDeletedCount to 0
+	
 	display notification "Export de " & totalItems & " elements..." with title "Export avec ID"
-
+	
 	repeat with i from 1 to totalItems
 		set theItem to item i of mediaItems
 		set itemTempPath to ""
-		set itemOK to false
-
+		set itemDelivered to false
+		
 		try
 			-- 1) Nom base date + ID court stable
 			set imgDate to date of theItem
@@ -133,96 +161,148 @@ tell application "Photos"
 			set itemTempFolder to POSIX file itemTempPath as alias
 			export {theItem} to itemTempFolder without using originals
 			
-			-- 3) Recuperer les fichiers media exportes (filtre les .aae et autres sidecars)
-			-- Note: les noms de fichiers exportes par Photos.app ne contiennent pas de retours a la ligne
-			set exportedRaw to do shell script "find " & quoted form of itemTempPath & " -maxdepth 1 -type f | grep -iE '\\.(jpg|jpeg|heic|heif|png|tiff|tif|bmp|gif|webp|raw|cr2|nef|arw|dng|mov|mp4|m4v|avi|mkv|3gp|mts|m2ts|wmv|webm)$' | LC_ALL=C sort || true"
+			-- 3) Recuperer tous les fichiers exportes
+			set exportedRaw to do shell script "find " & quoted form of itemTempPath & " -maxdepth 1 -type f | LC_ALL=C sort || true"
 			set exportedPaths to my linesFromText(exportedRaw)
-
+			
 			if (count of exportedPaths) is 0 then
-				set skippedCount to skippedCount + 1
 				set runLog to my appendLog(runLog, "SKIP item " & i & " : export introuvable")
 			else
-				-- 4) Traiter chaque fichier exporte (photo et/ou video)
 				repeat with exportedFile in exportedPaths
 					set inputFilePath to contents of exportedFile
 					set inputExt to my extensionFromPath(inputFilePath)
-
-					-- Defense en profondeur : ignorer les fichiers non-media
-					if not my isMediaExtension(inputExt) then
-						set runLog to my appendLog(runLog, "SKIP-FILE item " & i & " : non-media " & inputFilePath)
-					else
+					
+					if my isMediaExtension(inputExt) then
 						set inputIsVideo to my isVideoExtension(inputExt)
-
+						
 						if inputIsVideo then
 							if inputExt is "" then
 								set targetExt to "mov"
 							else
 								set targetExt to inputExt
 							end if
+							
+							try
+								set outputFilePath to my atomicCopyFile(inputFilePath, destPath, finalStem, targetExt)
+								if outputFilePath is "FAIL" then error "atomic copy failed" number -8100
+								set primaryFileCount to primaryFileCount + 1
+								set deliveredFileCount to deliveredFileCount + 1
+								set itemDelivered to true
+								set end of createdOutputPaths to outputFilePath
+								set runLog to my appendLog(runLog, "OK item " & i & " : " & outputFilePath)
+							on error copyErrMsg number copyErrNum
+								set fallbackExt to inputExt
+								if fallbackExt is "" then set fallbackExt to "bin"
+								try
+									set fallbackPath to my atomicCopyFile(inputFilePath, destPath, finalStem & "-orig", fallbackExt)
+									if fallbackPath is "FAIL" then error "atomic fallback failed" number -8200
+									set fallbackFileCount to fallbackFileCount + 1
+									set deliveredFileCount to deliveredFileCount + 1
+									set itemDelivered to true
+									set end of createdOutputPaths to fallbackPath
+									set runLog to my appendLog(runLog, "FALLBACK item " & i & " : " & fallbackPath & " (erreur copy " & copyErrNum & ")")
+								on error fallbackErrMsg number fallbackErrNum
+									set failedCount to failedCount + 1
+									set runLog to my appendLog(runLog, "FAIL item " & i & " : copy=" & copyErrNum & ", fallback=" & fallbackErrNum)
+								end try
+							end try
 						else
 							set targetExt to "jpg"
-						end if
-
-						try
-							if inputIsVideo then
-								set outputFilePath to my atomicCopyFile(inputFilePath, destPath, finalStem, targetExt)
-							else
-								set outputFilePath to my atomicSipsConvert(inputFilePath, destPath, finalStem, targetExt)
-							end if
-							if outputFilePath is "FAIL" then error "atomic write failed" number -1
-							set fileCount to fileCount + 1
-							set itemOK to true
-							set runLog to my appendLog(runLog, "OK item " & i & " : " & outputFilePath)
-						on error convertErrMsg number convertErrNum
-							-- Fallback : garder une copie originale exportee pour ne pas perdre l'item
-							set fallbackExt to inputExt
-							if fallbackExt is "" then set fallbackExt to "bin"
 							try
-								set fallbackPath to my atomicCopyFile(inputFilePath, destPath, finalStem & "-orig", fallbackExt)
-								if fallbackPath is "FAIL" then error "atomic fallback failed" number -2
-								set fallbackCount to fallbackCount + 1
-								set runLog to my appendLog(runLog, "FALLBACK item " & i & " : " & fallbackPath & " (erreur " & convertErrNum & ")")
-							on error fallbackErrMsg number fallbackErrNum
-								set failedCount to failedCount + 1
-								set runLog to my appendLog(runLog, "FAIL item " & i & " : conversion=" & convertErrNum & ", fallback=" & fallbackErrNum)
+								set outputFilePath to my atomicSipsConvert(inputFilePath, destPath, finalStem, targetExt)
+								if outputFilePath is "FAIL" then error "atomic convert failed" number -8300
+								set primaryFileCount to primaryFileCount + 1
+								set deliveredFileCount to deliveredFileCount + 1
+								set itemDelivered to true
+								set end of createdOutputPaths to outputFilePath
+								set runLog to my appendLog(runLog, "OK item " & i & " : " & outputFilePath)
+							on error convertErrMsg number convertErrNum
+								set jpgConversionFailureCount to jpgConversionFailureCount + 1
+								set fallbackExt to inputExt
+								if fallbackExt is "" then set fallbackExt to "bin"
+								try
+									set fallbackPath to my atomicCopyFile(inputFilePath, destPath, finalStem & "-orig", fallbackExt)
+									if fallbackPath is "FAIL" then error "atomic fallback failed" number -8400
+									set fallbackFileCount to fallbackFileCount + 1
+									set jpgFallbackFileCount to jpgFallbackFileCount + 1
+									set deliveredFileCount to deliveredFileCount + 1
+									set itemDelivered to true
+									set end of createdOutputPaths to fallbackPath
+									set runLog to my appendLog(runLog, "FALLBACK item " & i & " : " & fallbackPath & " (erreur JPG " & convertErrNum & ")")
+								on error fallbackErrMsg number fallbackErrNum
+									set failedCount to failedCount + 1
+									set runLog to my appendLog(runLog, "FAIL item " & i & " : convert=" & convertErrNum & ", fallback=" & fallbackErrNum)
+								end try
 							end try
-						end try
+						end if
+						
+					else if my isSidecarExtension(inputExt) then
+						set runLog to my appendLog(runLog, "SKIP-FILE item " & i & " : sidecar " & inputFilePath)
+					else
+						set abortRun to true
+						set abortExtension to inputExt
+						if abortExtension is "" then set abortExtension to "(no extension)"
+						set abortFilePath to inputFilePath
+						error "UNKNOWN_EXTENSION" number -7001
 					end if
 				end repeat
-				if itemOK then set itemSuccessCount to itemSuccessCount + 1
 			end if
 			
 		on error itemErrMsg number itemErrNum
-			set failedCount to failedCount + 1
-			set runLog to my appendLog(runLog, "FAIL item " & i & " : " & itemErrNum & " (" & itemErrMsg & ")")
+			if itemErrNum is -7001 then
+				set runLog to my appendLog(runLog, "ABORT item " & i & " : nouvelle extension detectee (" & abortExtension & ") -> rollback")
+			else
+				set failedCount to failedCount + 1
+				set runLog to my appendLog(runLog, "FAIL item " & i & " : " & itemErrNum & " (" & itemErrMsg & ")")
+			end if
 		end try
 		
-		-- 5) Progression
-		if i mod 10 is 0 then
-			display notification "Exporte " & i & " / " & totalItems & "..." with title "Export avec ID"
+		if itemDelivered then
+			set deliveredItemCount to deliveredItemCount + 1
+		else if not abortRun then
+			set skippedItemCount to skippedItemCount + 1
 		end if
-
-		-- 6) Nettoyage temp item, meme en cas d'erreur
+		
+		-- Nettoyage temp item, meme en cas d'erreur
 		if itemTempPath is not "" then
 			try
 				do shell script "rm -rf " & quoted form of itemTempPath
 			end try
 		end if
+		
+		if abortRun then exit repeat
+		
+		-- Progression
+		if i mod 10 is 0 then
+			display notification "Exporte " & i & " / " & totalItems & "..." with title "Export avec ID"
+		end if
 	end repeat
 	
-	-- 7) Nettoyage temp run final
+	-- Nettoyage temp run final
 	try
 		do shell script "rm -rf " & quoted form of tempRootPath
 	end try
 	
-	-- 8) Rapport persistant + resume
-	set summaryText to "Export termine." & return & "Items: " & itemSuccessCount & " OK / " & totalItems & " total" & return & "Fichiers: " & fileCount & " exportes" & return & "Fallback: " & fallbackCount & return & "Ignores: " & skippedCount & return & "Echecs: " & failedCount
+	-- Si extension inconnue, rollback complet des fichiers crees
+	if abortRun then
+		set rollbackDeletedCount to my rollbackCreatedFiles(createdOutputPaths)
+		set summaryText to "Nouvelle extension detectee (" & abortExtension & "). Export reverti. Merci de mettre a jour le script." & return & "Fichier: " & abortFilePath & return & "Fichiers de ce run supprimes: " & rollbackDeletedCount
+	else
+		if deliveredItemCount is totalItems then
+			set summaryLead to "Tous les items ont ete livres (" & totalItems & ")."
+		else
+			set summaryLead to "Items livres: " & deliveredItemCount & " / " & totalItems
+		end if
+		set summaryText to summaryLead & return & "Fichiers exportes: " & deliveredFileCount & " (standard: " & primaryFileCount & ", fallback: " & fallbackFileCount & ")" & return & "Conversions JPG impossibles: " & jpgConversionFailureCount & " ; sauvegardees en originaux: " & jpgFallbackFileCount & return & "Items ignores: " & skippedItemCount & return & "Erreurs: " & failedCount
+	end if
+	
+	-- Rapport persistant + resume
 	set reportPath to destPath & "export-report-" & runToken & ".txt"
 	
 	try
 		set reportRef to open for access (POSIX file reportPath) with write permission
 		set eof reportRef to 0
-		write ("Export report" & return & "Run: " & runToken & return & "Total selection: " & totalItems & return & "Items OK: " & itemSuccessCount & return & "Fichiers exportes: " & fileCount & return & "Fallback: " & fallbackCount & return & "Ignores: " & skippedCount & return & "Echecs: " & failedCount & return & return & runLog) to reportRef
+		write ("Export report" & return & "Run: " & runToken & return & "Total selection: " & totalItems & return & "Items livres: " & deliveredItemCount & return & "Fichiers exportes: " & deliveredFileCount & return & "Fichiers standard: " & primaryFileCount & return & "Fichiers fallback: " & fallbackFileCount & return & "Conversions JPG impossibles: " & jpgConversionFailureCount & return & "Conversions JPG sauvees en originaux: " & jpgFallbackFileCount & return & "Items ignores: " & skippedItemCount & return & "Erreurs: " & failedCount & return & "Abort run: " & abortRun & return & "Extension inconnue: " & abortExtension & return & "Fichier extension inconnue: " & abortFilePath & return & "Rollback fichiers supprimes: " & rollbackDeletedCount & return & return & runLog) to reportRef
 		close access reportRef
 		set summaryText to summaryText & return & "Rapport: " & reportPath
 	on error reportErrMsg
